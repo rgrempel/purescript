@@ -33,6 +33,8 @@ import Language.PureScript.TypeChecker.Monad
 import Language.PureScript.TypeChecker.Unify
 import Language.PureScript.TypeClassDictionaries
 import Language.PureScript.Types
+import Language.PureScript.Kinds (Kind(..))
+import Language.PureScript.TypeChecker.Kinds (kindOf)
 import qualified Language.PureScript.Constants as C
 
 -- | The 'InstanceContext' tracks those constraints which can be satisfied.
@@ -108,7 +110,11 @@ entails shouldGeneralize deferErrors (TypeClassDictionary constraint context hin
     solve constraint
   where
     forClassName :: InstanceContext -> Qualified (ProperName 'ClassName) -> [Type] -> [TypeClassDictionaryInScope]
-    forClassName ctx cn@(Qualified (Just mn) _) tys = concatMap (findDicts ctx cn) (nub (Nothing : Just mn : map Just (mapMaybe ctorModules tys)))
+    forClassName ctx cn@(Qualified (Just mn) _) tys =
+      -- We check for existing dictionaries in scope first, then see if we can inline
+      case concatMap (findDicts ctx cn) (nub (Nothing : Just mn : map Just (mapMaybe ctorModules tys))) of
+        [] -> tryInlining cn tys
+        found -> found
     forClassName _ _ _ = internalError "forClassName: expected qualified class name"
 
     ctorModules :: Type -> Maybe ModuleName
@@ -165,8 +171,9 @@ entails shouldGeneralize deferErrors (TypeClassDictionary constraint context hin
                 let subst'' = fmap (substituteType currentSubst') subst'
                 -- Solve any necessary subgoals
                 args <- solveSubgoals subst'' (tcdDependencies tcd)
+                expr <- lift . lift $ mkDictionary tcd args
                 let match = foldr (\(superclassName, index) dict -> subclassDictionaryValue dict superclassName index)
-                                  (mkDictionary (tcdName tcd) args)
+                                  expr
                                   (tcdPath tcd)
                 return match
               Unsolved unsolved -> do
@@ -256,10 +263,18 @@ entails shouldGeneralize deferErrors (TypeClassDictionary constraint context hin
               Just <$> traverse (go (work + 1) . mapConstraintArgs (map (replaceAllTypeVars (M.toList subst)))) subgoals
 
             -- Make a dictionary from subgoal dictionaries by applying the correct function
-            mkDictionary :: Qualified Ident -> Maybe [Expr] -> Expr
-            mkDictionary fnName Nothing = Var fnName
-            mkDictionary fnName (Just []) = Var fnName
-            mkDictionary fnName (Just dicts) = foldl App (Var fnName) dicts
+            mkDictionary :: TypeClassDictionaryInScope -> Maybe [Expr] -> m Expr
+            mkDictionary (TypeClassDictionaryInScope (Qualified Nothing (Ident "")) _ cn tys _) Nothing = inlineDictionary cn tys
+            mkDictionary (TypeClassDictionaryInScope (Qualified Nothing (Ident "")) _ cn tys _) es = internalError ("Inlined dictionary should not have dependencies: " <> show cn <> " " <> show tys <> " " <> show es)
+            mkDictionary tcd Nothing = return $ Var (tcdName tcd)
+            mkDictionary tcd (Just []) = return $ Var (tcdName tcd)
+            mkDictionary tcd (Just dicts) = return $ foldl App (Var (tcdName tcd)) dicts
+
+            inlineDictionary :: Qualified (ProperName 'ClassName) -> [Type] -> m Expr
+            inlineDictionary cn (ty : _) | cn == typeableClassName = do
+              tyLit <- typeRepLiteral ty
+              return $ Literal $ ObjectLiteral [("typeRepT", tyLit)]
+            inlineDictionary cn _ = internalError ("Trying to inline dictionary for unexpected typeclass: " <> show cn)
 
         -- Turn a DictionaryValue into a Expr
         subclassDictionaryValue :: Expr -> Qualified (ProperName a) -> Integer -> Expr
@@ -282,6 +297,7 @@ matches deps TypeClassDictionaryInScope{..} tys = do
     let determinedSet = foldMap (S.fromList . fdDetermined) deps
         solved = map snd . filter ((`S.notMember` determinedSet) . fst) $ zipWith (\(_, ts) i -> (i, ts)) matched [0..]
     verifySubstitution (M.unionsWith (++) solved)
+
   where
     -- | Find the closure of a set of functional dependencies.
     covers :: [(Bool, subst)] -> Bool
@@ -422,3 +438,153 @@ pairwiseM :: Applicative m => (a -> a -> m ()) -> [a] -> m ()
 pairwiseM _ [] = pure ()
 pairwiseM _ [_] = pure ()
 pairwiseM p (x : xs) = traverse (p x) xs *> pairwiseM p xs
+
+
+-- See if we can inline a typeclass instance.
+tryInlining :: Qualified (ProperName 'ClassName) -> [Type] -> [TypeClassDictionaryInScope]
+tryInlining cn (ty : _) | cn == typeableClassName && canInlineTypeable ty =
+  [TypeClassDictionaryInScope (Qualified Nothing (Ident "")) [] typeableClassName [ty] Nothing]
+tryInlining _ _ = []
+
+
+canInlineTypeable :: Type -> Bool
+canInlineTypeable = everythingOnTypes (&&) canInline
+  where
+    -- Make sure we have a module name
+    canInline (TypeConstructor (Qualified (Just _) _)) = True
+    canInline TypeLevelString{} = True
+    canInline TypeApp{} = True
+    canInline REmpty{} = True
+    canInline RCons{} = True
+    canInline KindedType{} = True
+    canInline _ = False
+
+
+-- |
+-- The qualified name for Type.Typeable.Typeable, which is a constraint that the
+-- compiler treats specially, inlining instances on the fly when requested.
+-- This means that you don't have to define your own `Typeable` instances (or
+-- even derive them), which is sensible, because the compiler already
+-- knows everything needed to make an instance when one is wanted.
+--
+-- An alternative would be to make `Typeable` a primitive class name, like `Partial`.
+--
+typeableClassName :: Qualified (ProperName 'ClassName)
+typeableClassName =
+  mkQualified (ProperName "Typeable") (moduleNameFromString "Type.Typeable")
+
+
+-- Construct a literal representation for the type `a` when inlining a
+-- `Typeable a` dictionary.
+--
+-- Because we're inlining these where demanded, it is convenient to represent
+-- them using only primitive types. Otherwise, we'd have to arrange to bring
+-- the relevant ADT into scope on-demand, which seems awkward.
+--
+-- So, this generates a literal which is essentially a `Foreign` in Purescript
+-- terms. Since this is literally inserted into the source, and may be done so
+-- many times, the form of the literal is very compact. Basically, each `TypeRep`
+-- is a primitive array, where the first value is an integer, representing
+-- what might normally be a data constructor, and the remaining values are the
+-- arguments which that data constructor would normally take.
+--
+-- We leave off the KindRep information in cases where it can be inferred from
+-- the type.
+typeRepLiteral
+  :: forall m. (MonadError MultipleErrors m, MonadState CheckState m, MonadWriter MultipleErrors m)
+  => Type
+  -> m Expr
+typeRepLiteral ty =
+  case ty of
+    TypeLevelString s ->
+      return $ ctor 0 [string s]
+
+    -- Note that we don't match if the module name is unspecified
+    TypeConstructor (Qualified (Just tyConModule) tyConName) -> do
+      kind <- kindOf ty
+      return $ ctor 1
+        [ string (runModuleName tyConModule)
+        , string (runProperName tyConName)
+        , kindRepLiteral kind
+        ]
+
+    TypeApp tyFunc tyArg -> do
+      tf <- typeRepLiteral tyFunc
+      ta <- typeRepLiteral tyArg
+      return $ ctor 2 [tf, ta]
+
+    -- For rows, we need to explicitly give the kind information, since
+    -- we wouldn't be able to infer it in the case of empty rows.
+    REmpty -> do
+      kind <- kindOf ty
+      return $ ctor 3
+        [ object []
+        , kindRepLiteral kind
+        ]
+
+    RCons{} -> do
+      kind <- kindOf ty
+      rows <- accumRows ty []
+      return $ ctor 3
+        [ object rows
+        , kindRepLiteral kind
+        ]
+
+    KindedType t _ ->
+      typeRepLiteral t
+
+    _ ->
+        internalError $ "Attempting to inline a `TypeRepT` for a type that should not be reachable here: " <> show ty
+
+  where
+    -- Recurse into the supplied type, using the supplied accumulator
+    -- to accumulate `RCons` values, so long as we keep finding them.
+    accumRows :: Type -> [(String, Expr)] -> m [(String, Expr)]
+    accumRows (RCons label t t') acc = do
+      row <- typeRepLiteral t
+      accumRows t' ((label, row) : acc)
+    accumRows _ acc = return acc
+
+    string :: String -> Expr
+    string = Literal . StringLiteral
+
+    ctor :: Integer -> [Expr] -> Expr
+    ctor i e = array (integer i : e)
+
+    integer :: Integer -> Expr
+    integer = Literal . NumericLiteral . Left
+
+    object :: [(String, Expr)] -> Expr
+    object = Literal . ObjectLiteral
+
+    array :: [Expr] -> Expr
+    array = Literal . ArrayLiteral
+
+    -- Constructs a literal to represent the kind. We use the 'ctor' tag, rather than
+    -- the actual ADT constructor we'd ultimately like, so that we don't have to
+    -- arrange to bring the actual ADT constructor into scope. So, this becomes what
+    -- is basically a `Foreign` value for the Purescript code to decode. (Which is
+    -- provided for in `Type.Typeable`).
+    kindRepLiteral :: Kind -> Expr
+    kindRepLiteral k =
+      case k of
+        KUnknown _ ->
+          internalError "Kinds should be inferred by now."
+
+        Star ->
+          ctor 0 []
+
+        Bang ->
+          ctor 1 []
+
+        Row r ->
+          ctor 2 [kindRepLiteral r]
+
+        FunKind arg result ->
+          ctor 3
+            [ kindRepLiteral arg
+            , kindRepLiteral result
+            ]
+
+        Symbol ->
+          ctor 4 []
